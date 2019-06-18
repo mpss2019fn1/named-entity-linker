@@ -1,4 +1,5 @@
 import requests
+import csv
 
 from named_entity_linker import NamedEntityLinker, NamedEntity
 
@@ -28,7 +29,7 @@ class WikidataEntityLinker(NamedEntityLinker):
             not_found_entities = set()
         entity_index = 0
 
-        ENTITIES_PER_REQUEST = 500
+        ENTITIES_PER_REQUEST = 50
         for i in range(0, len(entities), ENTITIES_PER_REQUEST):
             index_range = slice(i, min(len(entities), i + ENTITIES_PER_REQUEST))
             titles = "|".join(entities[index_range])
@@ -36,9 +37,13 @@ class WikidataEntityLinker(NamedEntityLinker):
 
             query_result = self._execute_query(titles, normalize)
             if query_result.status_code != 200:
-                raise Exception("Failed to execute query")
+                raise Exception("http request to fetch wikidata ids to entity failed")
 
             query_result_json = query_result.json()
+
+            if 'entities' not in query_result_json:
+                raise Exception("http request failed, Key 'entities' not found in result")
+
             for key, value in query_result_json['entities'].items():
                 description = None
                 if key[0] != 'Q':
@@ -52,7 +57,7 @@ class WikidataEntityLinker(NamedEntityLinker):
                 while entities[entity_index] in not_found_entities:
                     entity_index += 1
 
-                if description == 'Wikimedia disambiguation page':
+                if 'disambiguation page' in description:
                     not_found_entities.add(entities[entity_index])
                 else:
                     linked_entities[entities[entity_index]] = WikidataNamedEntity(entities[entity_index], key,
@@ -101,19 +106,32 @@ class WikidataEntityLinker(NamedEntityLinker):
 
         return batch_mapping
 
+    @staticmethod
+    def normalize(entity):
+        return entity.capitalize()
+
 
 if __name__ == '__main__':
+
+    entities = set()
+
+    with open('/home/mapp/masterprojekt/embedding-evaluation/data/MEN_full.csv') as csvfile:
+        reader = csv.reader(csvfile, delimiter=' ')
+        next(reader)
+        for row in reader:
+            entities.add(WikidataEntityLinker.normalize(row[0]))
+            entities.add(WikidataEntityLinker.normalize(row[1]))
+
     # 1. Bilde eine
     nel = WikidataEntityLinker()
     # nel.entity_id("brmbrmi|Petal|Roof|Angela Merkel|Joschka Fischer|Door|roof|jdhfjk")
 
     # normalisiere Einträge vorab? z.B, Erster Buchstabe groß?
 
+
     not_found_entities = set()
 
-    ret = nel.entity_ids(
-        ["CAR", "Angela_Merkel", "Fridolin", "Joschka_Fischer", "Donald Trump", "Car", "Dandelion", "Mathias"],
-        not_found_entities)
+    ret = nel.entity_ids(list(entities), not_found_entities)
     print("Found entities:")
     for k, v in ret.items():
         print(k, v)
