@@ -1,4 +1,7 @@
 from abc import ABC, abstractmethod
+from enum import Enum, auto
+
+
 
 class NamedEntity:
     """
@@ -11,10 +14,23 @@ class NamedEntity:
     def __str__(self):
         return '{}, {}'.format(self.entity, self.linked_entity)
 
+
+class NamedEntityLinking(Enum):
+    SUCCESS = auto(),
+    NOT_FOUND = auto(),
+    NO_LINKING_FOUND = auto()
+
+
 class NamedEntityLinker(ABC):
 
     @abstractmethod
     def entity_id(self, entity):
+        """
+
+        :param entity:
+        :return: A tuple<NamedEntity, NamedEntityLinking>. The first value contains the NamedEntity or None if entity
+            could not be linked. The second value may give additional information on why the linking did not succeed.
+        """
         pass
 
     @abstractmethod

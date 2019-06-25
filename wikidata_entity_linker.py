@@ -3,10 +3,11 @@ import csv
 import math
 import os
 
-from named_entity_linker import NamedEntityLinker, NamedEntity
+from named_entity_linker import NamedEntityLinker, NamedEntity, NamedEntityLinking
 
 
 class WikidataNamedEntity(NamedEntity):
+
     def __init__(self, entity, linked_entity, description):
         NamedEntity.__init__(self, entity, linked_entity)
         self.description = description
@@ -16,6 +17,7 @@ class WikidataNamedEntity(NamedEntity):
 
 
 class PersistentEntityLinker(NamedEntityLinker):
+
     def __init__(self, filename):
         """
 
@@ -39,7 +41,6 @@ class PersistentEntityLinker(NamedEntityLinker):
             with open(self._filename, "a") as file:
                 csv.writer(file).writerow(["entity", "linked_entity", "description"])
 
-
     def __del__(self):
         self._dictionary_file.close()
 
@@ -49,26 +50,31 @@ class PersistentEntityLinker(NamedEntityLinker):
             writer.writerow(["entity", "linked_entity", "description"])
 
         writer.writerow([wikidata_named_entity.entity, wikidata_named_entity.linked_entity,
-                        wikidata_named_entity.description])
+                         wikidata_named_entity.description])
 
         self._dictionary[wikidata_named_entity.entity] = wikidata_named_entity
 
     def entity_id(self, entity):
         named_entity = self._dictionary.get(entity, None)
+        linking_info = NamedEntityLinking.SUCCESS
         if named_entity is not None:
             if named_entity.linked_entity == '':
                 named_entity = None
-        return named_entity
+                linking_info = NamedEntityLinking.NO_LINKING_FOUND
+        else:
+            linking_info = NamedEntityLinking.NOT_FOUND
+        return named_entity, linking_info
 
     def entity_ids(self, entities, not_found_entities=None):
         dictionary = dict()
         for entity in entities:
-            named_entity = self.entity_id(entity)
-            if named_entity == None:
-                if not_found_entities is not None:
-                    not_found_entities.add(entity)
-            else:
+            named_entity, linking_info = self.entity_id(entity)
+
+            if linking_info == NamedEntityLinking.SUCCESS:
                 dictionary[entity] = named_entity
+            elif not_found_entities is not None:
+                not_found_entities.add(entity)
+
         return dictionary
 
 
@@ -165,11 +171,11 @@ class WikidataEntityLinker(NamedEntityLinker):
         assert len(result) < 2, "An entity should only be linked to max one id."
 
         if len(result) == 0:
-            return None
+            return None, NamedEntityLinking.NOT_FOUND
 
-        return self._link_entities([entity], not_found_entities=None, session=session).items()[0]
+        return list(result.values())[0], NamedEntityLinking.SUCCESS
 
-    def entity_ids(self, entities, not_found_entities=None):
+    def entity_ids(self, entities, not_found_entities=None, session=requests.Session()):
         """
         Requests wikidata ids to every entity in entities.
         The linking is performed using wikidata's API call to 'wbgetentities'.
@@ -185,14 +191,13 @@ class WikidataEntityLinker(NamedEntityLinker):
             to the dictionary.
         """
         missing_batch_entities = set()
-        session = requests.Session()
         batch_mapping = self._link_entities(entities, missing_batch_entities, session)
 
         entity_counter = 0
         for entity in missing_batch_entities:
             entity_counter += 1
             print(f'Linking single entity {entity_counter}/{len(missing_batch_entities)}')
-            linked_entity = self.entity_id(entity, session)
+            linked_entity, linking_info = self.entity_id(entity, session)
             if linked_entity is None:
                 if not_found_entities is not None:
                     not_found_entities.add(entity)
@@ -207,28 +212,110 @@ class WikidataEntityLinker(NamedEntityLinker):
         return entity.capitalize()
 
 
+class WikidataEntityLinkerProxy(NamedEntityLinker):
+    def __init__(self, filename):
+        """
+
+        :param filename: Path to persistent storage
+        """
+        self._wikidata_entity_linker = WikidataEntityLinker()
+        self._persistent_entity_linker = PersistentEntityLinker(filename)
+        self._session = requests.Session()
+
+    def entity_id(self, entity):
+        linked_entity, linking_info = self._persistent_entity_linker.entity_id(entity)
+
+        if linking_info == NamedEntityLinking.SUCCESS:
+            return linked_entity, linking_info
+
+        if linking_info == NamedEntityLinking.NOT_FOUND:
+            linked_entity, linking_info = self._wikidata_entity_linker.entity_id(entity, self._session)
+            if linking_info == NamedEntityLinking.SUCCESS:
+                self._persistent_entity_linker.persist_entity(linked_entity)
+            else:
+                self._persistent_entity_linker.persist_entity(WikidataNamedEntity(entity, "", ""))
+
+        linked_entity, linking_info
+
+    def entity_ids(self, entities, not_found_entities=None):
+        # sammel alle entities, die wir so nicht an
+
+        not_matched_entities = set()
+        persistent_linked_entities = self._persistent_entity_linker.entity_ids(entities, not_matched_entities)
+
+        not_cached_entities = []
+
+        for entity in not_matched_entities:
+            linked_entity, linking_info = self._persistent_entity_linker.entity_id(entity)
+            if linking_info == NamedEntityLinking.NOT_FOUND:
+                not_cached_entities.append(entity)
+            elif not_found_entities is not None and linking_info == NamedEntityLinking.NO_LINKING_FOUND:
+                not_found_entities.add(entity)
+
+        not_matched_entities_using_wikidata = set()
+        linked_entities = self._wikidata_entity_linker.entity_ids(not_cached_entities,
+                                                                  not_matched_entities_using_wikidata, self._session)
+
+        for key, entity in linked_entities.items():
+            self._persistent_entity_linker.persist_entity(entity)
+
+        for entity in not_matched_entities_using_wikidata:
+            self._persistent_entity_linker.persist_entity(WikidataNamedEntity(entity, "", ""))
+            if not_found_entities is not None:
+                not_found_entities.add(entity)
+
+        smaller_dict = persistent_linked_entities
+        bigger_dict = linked_entities
+
+        if len(smaller_dict) > len(bigger_dict):
+            smaller_dict = linked_entities
+            bigger_dict = persistent_linked_entities
+
+        for key, value in smaller_dict.items():
+            bigger_dict[key] = value
+
+        return bigger_dict
+
+
 if __name__ == '__main__':
+    #
+    # pel = PersistentEntityLinker("test.csv")
+    #
+    # hallo = pel.entity_id("Hallo")
+    #
+    # pel.persist_entity(WikidataNamedEntity("Hallo", "", "Begrüßung"))
+    #
+    # hallo = pel.entity_id("Hallo")
+    #
+    # pel.persist_entity(WikidataNamedEntity("Hallo", "q123", "Begrüßung"))
+    #
+    # hallo = pel.entity_id("Hallo")
+
+    proxy = WikidataEntityLinkerProxy("test.csv")
     entities = set()
+    not_found_entities = set()
 
-    pel = PersistentEntityLinker("test.csv")
+    with open('/home/mapp/masterprojekt/embedding-evaluation/data/MEN_full.csv') as csvfile:
+        reader = csv.reader(csvfile, delimiter=' ')
+        next(reader)
+        for row in reader:
+            entities.add(WikidataEntityLinker.normalize(row[0]))
+            entities.add(WikidataEntityLinker.normalize(row[1]))
 
-    hallo = pel.entity_id("Hallo")
+    print(f'Linking {len(entities)} entities...')
 
-    pel.persist_entity(WikidataNamedEntity("Hallo", "", "Begrüßung"))
+    ret = proxy.entity_ids(list(entities), not_found_entities)
+    print("Found entities:")
+    for k, v in ret.items():
+        print(k, v)
 
-    hallo = pel.entity_id("Hallo")
+    print()
+    print("Not found entities:")
+    for item in not_found_entities:
+        print(item)
 
-    pel.persist_entity(WikidataNamedEntity("Hallo", "q123", "Begrüßung"))
+    print(f"{len(ret)}/{len(entities)} of entities found.")
 
-    hallo = pel.entity_id("Hallo")
-
-    pass
-
-    #
-    #
-    #
-    #
-    #
     # with open('/home/mapp/masterprojekt/embedding-evaluation/data/MEN_full.csv') as csvfile:
     #     reader = csv.reader(csvfile, delimiter=' ')
     #     next(reader)
