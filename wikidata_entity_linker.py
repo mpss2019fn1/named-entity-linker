@@ -1,7 +1,10 @@
+import sys
+
 import requests
 import csv
 import math
 import os
+import argparse
 
 from named_entity_linker import NamedEntityLinker, NamedEntity, NamedEntityLinking
 
@@ -80,7 +83,7 @@ class PersistentEntityLinker(NamedEntityLinker):
 
 class WikidataEntityLinker(NamedEntityLinker):
 
-    def _link_entities(self, entities, not_found_entities, session):
+    def _link_entities(self, entities, not_found_entities, session, batch_processed=None):
         """
         Requests wikidata ids to every entity in entities.
         The linking is performed using wikidata's API call to 'wbgetentities'.
@@ -91,13 +94,11 @@ class WikidataEntityLinker(NamedEntityLinker):
             WikidataEntityLinker will try to link several entities at once (in blocks of max. 50 entities per query).
             When fetching several ids at once, normalization (for example converting a word to ist base form) is not
             possible. This may result in less entries being found.
-        :param not_found_entities: Expects a list wich will be used to store entities which could not be linked.
+        :param not_found_entities: Expects a set which will be used to store entities that could not be linked.
         :return: Returns Dictionary<entity, WikidataNamedEntity>. Entities, which could not be linked, will not be added
             to the dictionary.
         """
         linked_entities = dict()
-        if not_found_entities is None:
-            not_found_entities = set()
 
         entity_index = 0
         entities_per_request = 50
@@ -108,6 +109,9 @@ class WikidataEntityLinker(NamedEntityLinker):
             titles = "|".join(entities[index_range])
             normalize = True if len(entities) == 1 else False
 
+            linked_entity_list = []
+            _not_found_entities = set()
+
             print(f"Processing batch {i // entities_per_request + 1}/{batch_count}")
             query_result = self._execute_query(titles, normalize, session)
             if query_result.status_code != 200:
@@ -117,12 +121,13 @@ class WikidataEntityLinker(NamedEntityLinker):
             query_result_json = query_result.json()
 
             if 'entities' not in query_result_json:
-                raise Exception("http request failed, Key 'entities' not found in result")
+                # add all to not found entities with warningl
+                raise Exception(f"http request failed, Key 'entities' not found in result. titles: {titles}, query_result: {query_result_json}")
 
             for key, value in query_result_json['entities'].items():
                 description = None
                 if key[0] != 'Q':
-                    not_found_entities.add(value['title'])
+                    _not_found_entities.add(value['title'])
                     continue
                 try:
                     description = value['descriptions']['en']['value']
@@ -133,13 +138,26 @@ class WikidataEntityLinker(NamedEntityLinker):
                     entity_index += 1
 
                 if description is not None and 'disambiguation page' in description:
-                    not_found_entities.add(entities[entity_index])
+                    _not_found_entities.add(entities[entity_index])
                 else:
-                    linked_entities[entities[entity_index]] = WikidataNamedEntity(entities[entity_index], key,
-                                                                                  description)
+                    linked_entity = WikidataNamedEntity(entities[entity_index], key, description)
+                    linked_entity_list.append(linked_entity)
+
                 entity_index += 1
 
+            for entity in linked_entity_list:
+                linked_entities[entity.entity] = entity
+
+            if not_found_entities is not None:
+                not_found_entities.update(_not_found_entities)
+
+            if batch_processed is not None:
+                batch_processed(linked_entity_list, _not_found_entities)
+
         return linked_entities
+
+    def _batch_processed(self, linked_entities, not_found_entities):
+        pass
 
     def _execute_query(self, titles, normalize, session=requests.Session()):
         wikidata_api_url = "https://www.wikidata.org/w/api.php"
@@ -278,6 +296,68 @@ class WikidataEntityLinkerProxy(NamedEntityLinker):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Named entity linker (without context). Links words to wikidata ids.')
+
+    parser.add_argument('model', help="File to model. This file has to be a csv file with the words to be linked "
+                                      "being in the first column. The file must contain a header row.")
+    parser.add_argument('-o', '--output', help="csv file to which the linking will be saved. (default='linking.csv')",
+                        default="linking.csv")
+    parser.add_argument('-c', '--cache', help="csv file which will be used to store all data fetched from wikidata to "
+                                              "speedup future queries. (default='cache.csv')", default="cache.csv")
+    parser.add_argument('-n', '--not-found-entities', help="file to which all not found entities will be stored  ("
+                                                           "default='not_found_entities.txt')",
+                        default="not_found_entities.txt")
+    parser.add_argument('-d', '--delimiter', help="delimiter used to parse file containing the model/word list. You "
+                                                  "may need to surround the delimiter with ''  ( "
+                                                  "default=' ')",
+                        default=" ")
+
+    args_dict = vars(parser.parse_args())
+
+    print(args_dict)
+
+    model_filename = args_dict['model']
+    output_filename = args_dict['output']
+    cache = args_dict['cache']
+    not_found_entities_filename = args_dict['not_found_entities']
+    delimiter = args_dict['delimiter']
+
+    # load model
+    entities = list()
+    with open(model_filename, "r") as model_file:
+        reader = csv.reader(model_file, delimiter=delimiter, quoting=csv.QUOTE_NONE)
+        next(reader)
+        for row in reader:
+            if '&' not in row[0] and '|' not in row[0]:
+                entities.append(row[0])
+
+    print(f'Linking {len(entities)} entities...')
+
+    not_found_entities = set()
+    proxy = WikidataEntityLinkerProxy(cache)
+    linked_entities = proxy.entity_ids(entities, not_found_entities)
+
+    print()
+    print(f"{len(linked_entities)}/{len(entities)} of entities found.")
+
+    print("Saving linked entities to ", output_filename)
+    with open(output_filename, "w+") as output_file:
+        writer = csv.writer(output_file, delimiter=',')
+        writer.writerow(['embedding_label', 'knowledgebase_id'])
+        for entity in linked_entities.values():
+            writer.writerow([entity.entity, entity.linked_entity])
+
+    print("Saving not linked entities to ", not_found_entities_filename)
+    with open(not_found_entities_filename, "w+") as output_file:
+        for item in not_found_entities:
+            writer = csv.writer(output_file, delimiter=',')
+            writer.writerow([item])
+
+    print("Finished.")
+
+    # Frage an, persistiere
+    # speichere
+
     #
     # pel = PersistentEntityLinker("test.csv")
     #
@@ -291,31 +371,10 @@ if __name__ == '__main__':
     #
     # hallo = pel.entity_id("Hallo")
 
-    proxy = WikidataEntityLinkerProxy("test.csv")
-    entities = set()
-    not_found_entities = set()
-
-    with open('/home/mapp/masterprojekt/embedding-evaluation/data/MEN_full.csv') as csvfile:
-        reader = csv.reader(csvfile, delimiter=' ')
-        next(reader)
-        for row in reader:
-            entities.add(WikidataEntityLinker.normalize(row[0]))
-            entities.add(WikidataEntityLinker.normalize(row[1]))
-
-    print(f'Linking {len(entities)} entities...')
-
-    ret = proxy.entity_ids(list(entities), not_found_entities)
-    print("Found entities:")
-    for k, v in ret.items():
-        print(k, v)
-
-    print()
-    print("Not found entities:")
-    for item in not_found_entities:
-        print(item)
-
-    print(f"{len(ret)}/{len(entities)} of entities found.")
-
+    # proxy = WikidataEntityLinkerProxy("test.csv")
+    # entities = set()
+    # not_found_entities = set()
+    #
     # with open('/home/mapp/masterprojekt/embedding-evaluation/data/MEN_full.csv') as csvfile:
     #     reader = csv.reader(csvfile, delimiter=' ')
     #     next(reader)
@@ -324,10 +383,8 @@ if __name__ == '__main__':
     #         entities.add(WikidataEntityLinker.normalize(row[1]))
     #
     # print(f'Linking {len(entities)} entities...')
-    # nel = WikidataEntityLinker()
-    # not_found_entities = set()
     #
-    # ret = nel.entity_ids(list(entities), not_found_entities)
+    # ret = proxy.entity_ids(list(entities), not_found_entities)
     # print("Found entities:")
     # for k, v in ret.items():
     #     print(k, v)
