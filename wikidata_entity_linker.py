@@ -83,7 +83,11 @@ class PersistentEntityLinker(NamedEntityLinker):
 
 class WikidataEntityLinker(NamedEntityLinker):
 
-    def _link_entities(self, entities, not_found_entities, session, batch_processed=None):
+    def __init__(self, session=requests.Session(), entities_per_request=50):
+        self._session = session
+        self.entities_per_request = entities_per_request
+
+    def _link_entities(self, entities, not_found_entities):
         """
         Requests wikidata ids to every entity in entities.
         The linking is performed using wikidata's API call to 'wbgetentities'.
@@ -98,68 +102,55 @@ class WikidataEntityLinker(NamedEntityLinker):
         :return: Returns Dictionary<entity, WikidataNamedEntity>. Entities, which could not be linked, will not be added
             to the dictionary.
         """
+        if len(entities) > self.entities_per_request:
+            raise Exception(f"Only {self.entities_per_request} entities are allowed per request. You are trying to "
+                            f"request {len(entities)} entities at once.")
+
         linked_entities = dict()
-
+        _not_found_entities = set()
         entity_index = 0
-        entities_per_request = 50
-        batch_count = math.ceil(len(entities) / entities_per_request)
-        for i in range(0, len(entities), entities_per_request):
-            # split entities in batches of max entities_per_request per request.
-            index_range = slice(i, min(len(entities), i + entities_per_request))
-            titles = "|".join(entities[index_range])
-            normalize = True if len(entities) == 1 else False
+        titles = "|".join(entities)
+        normalize = True if len(entities) == 1 else False
 
-            linked_entity_list = []
-            _not_found_entities = set()
+        query_result = self._execute_query(titles, normalize)
+        if query_result.status_code != 200:
+            raise Exception("http request to fetch wikidata ids to entity failed")
 
-            print(f"Processing batch {i // entities_per_request + 1}/{batch_count}")
-            query_result = self._execute_query(titles, normalize, session)
-            if query_result.status_code != 200:
-                raise Exception("http request to fetch wikidata ids to entity failed")
+        # parse results
+        query_result_json = query_result.json()
 
-            # parse results
-            query_result_json = query_result.json()
+        if 'entities' not in query_result_json:
+            # add all to not found entities with warning
+            raise Exception(f"http request failed, Key 'entities' not found in result. titles: {titles}, query_result: "
+                            f"{query_result_json}")
 
-            if 'entities' not in query_result_json:
-                # add all to not found entities with warningl
-                raise Exception(f"http request failed, Key 'entities' not found in result. titles: {titles}, query_result: {query_result_json}")
+        for key, value in query_result_json['entities'].items():
+            description = None
+            if key[0] != 'Q':
+                _not_found_entities.add(value['title'])
+                continue
+            try:
+                description = value['descriptions']['en']['value']
+            except KeyError:
+                pass
 
-            for key, value in query_result_json['entities'].items():
-                description = None
-                if key[0] != 'Q':
-                    _not_found_entities.add(value['title'])
-                    continue
-                try:
-                    description = value['descriptions']['en']['value']
-                except KeyError:
-                    pass
-
-                while entities[entity_index] in not_found_entities:
-                    entity_index += 1
-
-                if description is not None and 'disambiguation page' in description:
-                    _not_found_entities.add(entities[entity_index])
-                else:
-                    linked_entity = WikidataNamedEntity(entities[entity_index], key, description)
-                    linked_entity_list.append(linked_entity)
-
+            while entities[entity_index] in not_found_entities:
                 entity_index += 1
 
-            for entity in linked_entity_list:
-                linked_entities[entity.entity] = entity
+            if description is not None and 'disambiguation page' in description:
+                _not_found_entities.add(entities[entity_index])
+            else:
+                linked_entity = WikidataNamedEntity(entities[entity_index], key, description)
+                linked_entities[linked_entity.entity] = linked_entity
 
-            if not_found_entities is not None:
-                not_found_entities.update(_not_found_entities)
+            entity_index += 1
 
-            if batch_processed is not None:
-                batch_processed(linked_entity_list, _not_found_entities)
+        if not_found_entities is not None:
+            not_found_entities.update(_not_found_entities)
 
         return linked_entities
 
-    def _batch_processed(self, linked_entities, not_found_entities):
-        pass
-
-    def _execute_query(self, titles, normalize, session=requests.Session()):
+    def _execute_query(self, titles, normalize):
         wikidata_api_url = "https://www.wikidata.org/w/api.php"
         params = {
             'action': "wbgetentities",
@@ -173,9 +164,9 @@ class WikidataEntityLinker(NamedEntityLinker):
         if normalize:
             params['normalize'] = '1'
 
-        return session.get(url=wikidata_api_url, params=params)
+        return self._session.get(url=wikidata_api_url, params=params)
 
-    def entity_id(self, entity, session=requests.Session()):
+    def entity_id(self, entity):
         """
         Tries to link a single entity
         :param session:
@@ -185,7 +176,9 @@ class WikidataEntityLinker(NamedEntityLinker):
         if not entity:
             raise Exception("entity must not be None or empty.")
 
-        result = self._link_entities([entity], not_found_entities=None, session=session)
+        not_found_entities = set()
+
+        result = self._link_entities([entity], not_found_entities)
         assert len(result) < 2, "An entity should only be linked to max one id."
 
         if len(result) == 0:
@@ -193,7 +186,7 @@ class WikidataEntityLinker(NamedEntityLinker):
 
         return list(result.values())[0], NamedEntityLinking.SUCCESS
 
-    def entity_ids(self, entities, not_found_entities=None, session=requests.Session()):
+    def entity_ids(self, entities, not_found_entities=None):
         """
         Requests wikidata ids to every entity in entities.
         The linking is performed using wikidata's API call to 'wbgetentities'.
@@ -208,22 +201,26 @@ class WikidataEntityLinker(NamedEntityLinker):
         :return: Returns Dictionary<entity, WikidataNamedEntity>. Entities, which could not be linked, will not be added
             to the dictionary.
         """
+
+        if len(entities) > self.entities_per_request:
+            raise Exception(f"Only {self.entities_per_request} entities are allowed per request. You are trying to "
+                            f"request {len(entities)} entities at once.")
+
         missing_batch_entities = set()
-        batch_mapping = self._link_entities(entities, missing_batch_entities, session)
+        linked_entities = self._link_entities(entities, missing_batch_entities)
 
         entity_counter = 0
         for entity in missing_batch_entities:
             entity_counter += 1
-            print(f'Linking single entity {entity_counter}/{len(missing_batch_entities)}')
-            linked_entity, linking_info = self.entity_id(entity, session)
+            linked_entity, linking_info = self.entity_id(entity)
             if linked_entity is None:
                 if not_found_entities is not None:
                     not_found_entities.add(entity)
                 continue
 
-            batch_mapping[entity] = linked_entity
+            linked_entities[entity] = linked_entity
 
-        return batch_mapping
+        return linked_entities
 
     @staticmethod
     def normalize(entity):
@@ -332,6 +329,32 @@ if __name__ == '__main__':
                 entities.append(row[0])
 
     print(f'Linking {len(entities)} entities...')
+
+    # print(f'Requesting wikidata ids  {entity_counter}/{len(missing_batch_entities)}')
+    # for i in range(0, len(entities), self.entities_per_request):
+    #     # split entities in batches of max entities_per_request per request.
+    #     index_range = slice(i, min(len(entities), i + self.entities_per_request))
+    #
+    #     missing_batch_entities = set()
+    #     batch_mapping = self._link_entities(entities, missing_batch_entities)
+    #
+    #     if self.linking_received is not None:
+    #         self.linking_received(linked_entities.values(), set())
+    #
+    #     entity_counter = 0
+    #     for entity in missing_batch_entities:
+    #         entity_counter += 1
+    #         print(f'Linking single entity {entity_counter}/{len(missing_batch_entities)}')
+    #         linked_entity, linking_info = self.entity_id(entity)
+    #         if linked_entity is None:
+    #             if not_found_entities is not None:
+    #                 not_found_entities.add(entity)
+    #             continue
+    #
+    #         batch_mapping[entity] = linked_entity
+    #
+    #     linked_entities.update(batch_mapping)
+    # return batch_mapping
 
     not_found_entities = set()
     proxy = WikidataEntityLinkerProxy(cache)
