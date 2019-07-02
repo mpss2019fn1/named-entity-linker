@@ -353,17 +353,21 @@ def entity_linker_thread(reader, output_file_writer, not_found_entities_file_wri
             break
 
         not_found_entities = set()
-        linked_entities = proxy.entity_ids(entities, not_found_entities)
+        try:
+            linked_entities = proxy.entity_ids(entities, not_found_entities)
 
-        with write_lock:
-            for entity in linked_entities.values():
-                output_file_writer.writerow([entity.entity, entity.linked_entity])
+            with write_lock:
+                for entity in linked_entities.values():
+                    output_file_writer.writerow([entity.entity, entity.linked_entity])
 
-            for item in not_found_entities:
-                not_found_entities_file_writer.writerow([item])
+                for item in not_found_entities:
+                    not_found_entities_file_writer.writerow([item])
 
-            _rows_read += rows_read
-            print(f"{_rows_read} entities processed")
+                _rows_read += rows_read
+                print(f"{_rows_read} entities processed")
+        except:
+            pass
+
 
 
 if __name__ == '__main__':
@@ -380,8 +384,9 @@ if __name__ == '__main__':
                         default="not_found_entities.txt")
     parser.add_argument('-d', '--delimiter', help="delimiter used to parse file containing the model/word list. You "
                                                   "may need to surround the delimiter with ''  ( "
-                                                  "default=' ')",
-                        default=" ")
+                                                  "default=' ')")
+    parser.add_argument('-t', '--threads', help="number of parallel http requests (default=20)", default=20)
+
 
     args_dict = vars(parser.parse_args())
 
@@ -393,6 +398,7 @@ if __name__ == '__main__':
     not_found_entities_filename = args_dict['not_found_entities']
     delimiter = args_dict['delimiter']
     persistent_entity_linker = PersistentEntityLinker(cache)
+    thread_count = args_dict['threads']
 
     # load model
     entities_per_request = 50
@@ -414,7 +420,7 @@ if __name__ == '__main__':
 
         not_found_entities_file_writer = csv.writer(not_found_entities_file, delimiter=',')
 
-        for i in range(0, 10):
+        for i in range(0, thread_count):
             print("Spinng up thread", i+1)
             thread = threading.Thread(target=entity_linker_thread, args=(
                 reader, output_file_writer, not_found_entities_file_writer, read_lock, write_lock,
