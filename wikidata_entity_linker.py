@@ -107,6 +107,9 @@ class WikidataEntityLinker(NamedEntityLinker):
                             f"request {len(entities)} entities at once.")
 
         linked_entities = dict()
+        if len(entities) == 0:
+            return linked_entities
+
         _not_found_entities = set()
         entity_index = 0
         titles = "|".join(entities)
