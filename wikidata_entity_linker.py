@@ -1,10 +1,8 @@
-import sys
-
 import requests
 import csv
-import math
 import os
 import argparse
+import threading
 
 from named_entity_linker import NamedEntityLinker, NamedEntity, NamedEntityLinking
 
@@ -29,6 +27,7 @@ class PersistentEntityLinker(NamedEntityLinker):
         self._filename = filename
         self._initialize_dictionary()
         self._dictionary_file = open(filename, mode='a', buffering=1)
+        self._lock = threading.Lock()
 
     def _initialize_dictionary(self):
         self._dictionary = dict()
@@ -48,17 +47,20 @@ class PersistentEntityLinker(NamedEntityLinker):
         self._dictionary_file.close()
 
     def persist_entity(self, wikidata_named_entity):
-        writer = csv.writer(self._dictionary_file, delimiter=',')
-        if os.stat(self._filename).st_size == 0:
-            writer.writerow(["entity", "linked_entity", "description"])
+        with self._lock:
+            writer = csv.writer(self._dictionary_file, delimiter=',')
+            if os.stat(self._filename).st_size == 0:
+                writer.writerow(["entity", "linked_entity", "description"])
 
-        writer.writerow([wikidata_named_entity.entity, wikidata_named_entity.linked_entity,
-                         wikidata_named_entity.description])
+            writer.writerow([wikidata_named_entity.entity, wikidata_named_entity.linked_entity,
+                             wikidata_named_entity.description])
 
-        self._dictionary[wikidata_named_entity.entity] = wikidata_named_entity
+            self._dictionary[wikidata_named_entity.entity] = wikidata_named_entity
 
     def entity_id(self, entity):
-        named_entity = self._dictionary.get(entity, None)
+        with self._lock:
+            named_entity = self._dictionary.get(entity, None)
+
         linking_info = NamedEntityLinking.SUCCESS
         if named_entity is not None:
             if named_entity.linked_entity == '':
@@ -231,16 +233,28 @@ class WikidataEntityLinker(NamedEntityLinker):
 
 
 class WikidataEntityLinkerProxy(NamedEntityLinker):
-    def __init__(self, filename, entities_per_request=50):
+    def __init__(self, filename=None, entities_per_request=50, wikidata_entity_linker=None,
+                 persistent_entity_linker=None):
         """
 
         :param filename: Path to persistent storage
         """
-        self._session = requests.Session()
-        self._wikidata_entity_linker = WikidataEntityLinker(session=self._session,
-                                                            entities_per_request=entities_per_request)
-        self._persistent_entity_linker = PersistentEntityLinker(filename)
+        if filename is None:
+            if persistent_entity_linker is None:
+                raise Exception("If filename is None, persistent_entity_linker must be defined.")
+        elif persistent_entity_linker is not None:
+            raise Exception("If persistent_entity_linker is defined, filename must be None.")
 
+        if persistent_entity_linker is None:
+            self._persistent_entity_linker = PersistentEntityLinker(filename)
+        else:
+            self._persistent_entity_linker = persistent_entity_linker
+
+        if wikidata_entity_linker is None:
+            self._wikidata_entity_linker = WikidataEntityLinker(session=requests.session(),
+                                                                entities_per_request=entities_per_request)
+        else:
+            self._wikidata_entity_linker = wikidata_entity_linker
 
     def entity_id(self, entity):
         linked_entity, linking_info = self._persistent_entity_linker.entity_id(entity)
@@ -249,7 +263,7 @@ class WikidataEntityLinkerProxy(NamedEntityLinker):
             return linked_entity, linking_info
 
         if linking_info == NamedEntityLinking.NOT_FOUND:
-            linked_entity, linking_info = self._wikidata_entity_linker.entity_id(entity, self._session)
+            linked_entity, linking_info = self._wikidata_entity_linker.entity_id(entity)
             if linking_info == NamedEntityLinking.SUCCESS:
                 self._persistent_entity_linker.persist_entity(linked_entity)
             else:
@@ -297,9 +311,6 @@ class WikidataEntityLinkerProxy(NamedEntityLinker):
         return bigger_dict
 
 
-
-
-
 def link_entities(entities, output_file_writer, cache, not_found_entities_file_writer):
     not_found_entities = set()
     proxy = WikidataEntityLinkerProxy(cache)
@@ -311,6 +322,48 @@ def link_entities(entities, output_file_writer, cache, not_found_entities_file_w
     for item in not_found_entities:
         not_found_entities_file_writer.writerow([item])
 
+
+_rows_read = 0
+
+
+def entity_linker_thread(reader, output_file_writer, not_found_entities_file_writer, read_lock, write_lock,
+                         persistent_entity_linker, entities_per_request):
+    global _rows_read
+    entities = []
+
+    proxy = WikidataEntityLinkerProxy(persistent_entity_linker=persistent_entity_linker)
+
+    # Habe einen Threadpool, der fleißig auf diese Datei polled
+    reading = True
+    while reading:
+        reading = False
+        entities.clear()
+        rows_read = 0
+        read_lock.acquire()
+        for row in reader:
+            reading = True
+            if '&' not in row[0] and '|' not in row[0]:
+                entities.append(row[0])
+                rows_read += 1
+            if rows_read % entities_per_request == 0:
+                break
+        read_lock.release()
+
+        if not reading:
+            break
+
+        not_found_entities = set()
+        linked_entities = proxy.entity_ids(entities, not_found_entities)
+
+        with write_lock:
+            for entity in linked_entities.values():
+                output_file_writer.writerow([entity.entity, entity.linked_entity])
+
+            for item in not_found_entities:
+                not_found_entities_file_writer.writerow([item])
+
+            _rows_read += rows_read
+            print(f"{_rows_read} entities processed")
 
 
 if __name__ == '__main__':
@@ -339,14 +392,18 @@ if __name__ == '__main__':
     cache = args_dict['cache']
     not_found_entities_filename = args_dict['not_found_entities']
     delimiter = args_dict['delimiter']
+    persistent_entity_linker = PersistentEntityLinker(cache)
 
     # load model
     entities_per_request = 50
+    read_lock = threading.Lock()
+    write_lock = threading.Lock()
+    threads = []
 
     print(f'Starting to process model file {model_filename}...')
 
-    with open(model_filename, "r") as model_file,\
-            open(output_filename, "w+") as output_file,\
+    with open(model_filename, "r") as model_file, \
+            open(output_filename, "w+") as output_file, \
             open(not_found_entities_filename, "w+") as not_found_entities_file:
 
         reader = csv.reader(model_file, delimiter=delimiter, quoting=csv.QUOTE_NONE)
@@ -357,27 +414,20 @@ if __name__ == '__main__':
 
         not_found_entities_file_writer = csv.writer(not_found_entities_file, delimiter=',')
 
-        entities = []
-        rows_read = 0
+        for i in range(0, 10):
+            print("Spinng up thread", i+1)
+            thread = threading.Thread(target=entity_linker_thread, args=(
+                reader, output_file_writer, not_found_entities_file_writer, read_lock, write_lock,
+                persistent_entity_linker,
+                entities_per_request))
+            threads.append(thread)
+            thread.start()
 
-        for row in reader:
-            if '&' not in row[0] and '|' not in row[0]:
-                entities.append(row[0])
-                rows_read += 1
-            if rows_read % entities_per_request == 0:
-                link_entities(entities, output_file_writer, cache, not_found_entities_file_writer)
-                entities.clear()
-                print(f"{rows_read} entities processed")
-
-        modulo = rows_read % entities_per_request
-        if modulo > 0:
-            link_entities(entities, output_file_writer, cache, not_found_entities_file_writer)
-            print(f"{rows_read} entities processed")
-
+        for thread in threads:
+            thread.join()
 
     print()
     print("All done!")
-
 
     # print(f'Requesting wikidata ids  {entity_counter}/{len(missing_batch_entities)}')
     # for i in range(0, len(entities), self.entities_per_request):
@@ -404,11 +454,6 @@ if __name__ == '__main__':
     #
     #     linked_entities.update(batch_mapping)
     # return batch_mapping
-
-
-
-
-
 
     # Frage an, persistiere
     # speichere
