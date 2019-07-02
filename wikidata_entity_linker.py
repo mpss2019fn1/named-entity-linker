@@ -134,7 +134,7 @@ class WikidataEntityLinker(NamedEntityLinker):
             except KeyError:
                 pass
 
-            while entities[entity_index] in not_found_entities:
+            while entities[entity_index] in _not_found_entities:
                 entity_index += 1
 
             if description is not None and 'disambiguation page' in description:
