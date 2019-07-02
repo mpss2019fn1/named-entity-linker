@@ -228,14 +228,16 @@ class WikidataEntityLinker(NamedEntityLinker):
 
 
 class WikidataEntityLinkerProxy(NamedEntityLinker):
-    def __init__(self, filename):
+    def __init__(self, filename, entities_per_request=50):
         """
 
         :param filename: Path to persistent storage
         """
-        self._wikidata_entity_linker = WikidataEntityLinker()
-        self._persistent_entity_linker = PersistentEntityLinker(filename)
         self._session = requests.Session()
+        self._wikidata_entity_linker = WikidataEntityLinker(session=self._session,
+                                                            entities_per_request=entities_per_request)
+        self._persistent_entity_linker = PersistentEntityLinker(filename)
+
 
     def entity_id(self, entity):
         linked_entity, linking_info = self._persistent_entity_linker.entity_id(entity)
@@ -269,7 +271,7 @@ class WikidataEntityLinkerProxy(NamedEntityLinker):
 
         not_matched_entities_using_wikidata = set()
         linked_entities = self._wikidata_entity_linker.entity_ids(not_cached_entities,
-                                                                  not_matched_entities_using_wikidata, self._session)
+                                                                  not_matched_entities_using_wikidata)
 
         for key, entity in linked_entities.items():
             self._persistent_entity_linker.persist_entity(entity)
@@ -290,6 +292,22 @@ class WikidataEntityLinkerProxy(NamedEntityLinker):
             bigger_dict[key] = value
 
         return bigger_dict
+
+
+
+
+
+def link_entities(entities, output_file_writer, cache, not_found_entities_file_writer):
+    not_found_entities = set()
+    proxy = WikidataEntityLinkerProxy(cache)
+    linked_entities = proxy.entity_ids(entities, not_found_entities)
+
+    for entity in linked_entities.values():
+        output_file_writer.writerow([entity.entity, entity.linked_entity])
+
+    for item in not_found_entities:
+        not_found_entities_file_writer.writerow([item])
+
 
 
 if __name__ == '__main__':
@@ -320,15 +338,43 @@ if __name__ == '__main__':
     delimiter = args_dict['delimiter']
 
     # load model
-    entities = list()
-    with open(model_filename, "r") as model_file:
+    entities_per_request = 50
+
+    print(f'Starting to process model file {model_filename}...')
+
+    with open(model_filename, "r") as model_file,\
+            open(output_filename, "w+") as output_file,\
+            open(not_found_entities_filename, "w+") as not_found_entities_file:
+
         reader = csv.reader(model_file, delimiter=delimiter, quoting=csv.QUOTE_NONE)
         next(reader)
+
+        output_file_writer = csv.writer(output_file, delimiter=',')
+        output_file_writer.writerow(['embedding_label', 'knowledgebase_id'])
+
+        not_found_entities_file_writer = csv.writer(not_found_entities_file, delimiter=',')
+
+        entities = []
+        rows_read = 0
+
         for row in reader:
             if '&' not in row[0] and '|' not in row[0]:
                 entities.append(row[0])
+                rows_read += 1
+            if rows_read % entities_per_request == 0:
+                link_entities(entities, output_file_writer, cache, not_found_entities_file_writer)
+                entities.clear()
+                print(f"{rows_read} entities processed")
 
-    print(f'Linking {len(entities)} entities...')
+        modulo = rows_read % entities_per_request
+        if modulo > 0:
+            link_entities(entities, output_file_writer, cache, not_found_entities_file_writer)
+            print(f"{rows_read} entities processed")
+
+
+    print()
+    print("All done!")
+
 
     # print(f'Requesting wikidata ids  {entity_counter}/{len(missing_batch_entities)}')
     # for i in range(0, len(entities), self.entities_per_request):
@@ -356,27 +402,10 @@ if __name__ == '__main__':
     #     linked_entities.update(batch_mapping)
     # return batch_mapping
 
-    not_found_entities = set()
-    proxy = WikidataEntityLinkerProxy(cache)
-    linked_entities = proxy.entity_ids(entities, not_found_entities)
 
-    print()
-    print(f"{len(linked_entities)}/{len(entities)} of entities found.")
 
-    print("Saving linked entities to ", output_filename)
-    with open(output_filename, "w+") as output_file:
-        writer = csv.writer(output_file, delimiter=',')
-        writer.writerow(['embedding_label', 'knowledgebase_id'])
-        for entity in linked_entities.values():
-            writer.writerow([entity.entity, entity.linked_entity])
 
-    print("Saving not linked entities to ", not_found_entities_filename)
-    with open(not_found_entities_filename, "w+") as output_file:
-        for item in not_found_entities:
-            writer = csv.writer(output_file, delimiter=',')
-            writer.writerow([item])
 
-    print("Finished.")
 
     # Frage an, persistiere
     # speichere
