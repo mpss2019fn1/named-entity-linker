@@ -369,7 +369,6 @@ def entity_linker_thread(reader, output_file_writer, not_found_entities_file_wri
             pass
 
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Named entity linker (without context). Links words to wikidata ids.')
 
@@ -386,7 +385,8 @@ if __name__ == '__main__':
                                                   "may need to surround the delimiter with ''  ( "
                                                   "default=' ')")
     parser.add_argument('-t', '--threads', help="number of parallel http requests (default=20)", default=20)
-
+    parser.add_argument('-q', '--quotechar', help='character used to quote special characters (default="")',
+                        default="")
 
     args_dict = vars(parser.parse_args())
 
@@ -399,6 +399,7 @@ if __name__ == '__main__':
     delimiter = args_dict['delimiter']
     persistent_entity_linker = PersistentEntityLinker(cache)
     thread_count = args_dict['threads']
+    quotechar = args_dict['quotechar']
 
     # load model
     entities_per_request = 50
@@ -412,7 +413,12 @@ if __name__ == '__main__':
             open(output_filename, "w+") as output_file, \
             open(not_found_entities_filename, "w+") as not_found_entities_file:
 
-        reader = csv.reader(model_file, delimiter=delimiter, quoting=csv.QUOTE_NONE)
+        if quotechar == "":
+            quoting = csv.QUOTE_NONE
+        else:
+            quoting = csv.QUOTE_MINIMAL
+
+        reader = csv.reader(model_file, delimiter=delimiter, quoting=quoting, quotechar=quotechar)
         next(reader)
 
         output_file_writer = csv.writer(output_file, delimiter=',')
@@ -421,7 +427,7 @@ if __name__ == '__main__':
         not_found_entities_file_writer = csv.writer(not_found_entities_file, delimiter=',')
 
         for i in range(0, thread_count):
-            print("Spinng up thread", i+1)
+            print("Spinng up thread", i + 1)
             thread = threading.Thread(target=entity_linker_thread, args=(
                 reader, output_file_writer, not_found_entities_file_writer, read_lock, write_lock,
                 persistent_entity_linker,
