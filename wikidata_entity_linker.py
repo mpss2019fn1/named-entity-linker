@@ -5,6 +5,7 @@ import argparse
 import threading
 
 from named_entity_linker import NamedEntityLinker, NamedEntity, NamedEntityLinking
+from time import sleep
 
 
 class WikidataNamedEntity(NamedEntity):
@@ -117,9 +118,21 @@ class WikidataEntityLinker(NamedEntityLinker):
         titles = "|".join(entities)
         normalize = True if len(entities) == 1 else False
 
-        query_result = self._execute_query(titles, normalize)
-        if query_result.status_code != 200:
-            raise Exception("http request to fetch wikidata ids to entity failed")
+        try_count = 1
+        sleep_time_in_sec = 0
+        while True:
+            query_result = self._execute_query(titles, normalize)
+            if query_result.status_code != 200:
+                sleep_time_in_sec += 1
+                sleep(sleep_time_in_sec)
+            else:
+                break
+
+            try_count += 1
+            if try_count > 5:
+                raise Exception(
+                        f"http request to fetch wikidata ids to entity failed with {query_result.status_code}. query_result: {query_result}")
+
 
         # parse results
         query_result_json = query_result.json()
@@ -217,6 +230,7 @@ class WikidataEntityLinker(NamedEntityLinker):
         entity_counter = 0
         for entity in missing_batch_entities:
             entity_counter += 1
+            sleep(0.05)
             linked_entity, linking_info = self.entity_id(entity)
             if linked_entity is None:
                 if not_found_entities is not None:
@@ -365,11 +379,13 @@ def entity_linker_thread(reader, output_file_writer, not_found_entities_file_wri
 
                 _rows_read += rows_read
                 print(f"{_rows_read} entities processed")
-        except:
-            pass
+        except Exception as ex:
+            print(f"{'|'.join(entities)} caused exception: {ex}")
+
 
 
 if __name__ == '__main__':
+    # living_people_wikipedia_page_id.csv -q \" -o living_people_linking.csv -n not_found_people.csv -d="," -c living_people_cache.csv
     parser = argparse.ArgumentParser(description='Named entity linker (without context). Links words to wikidata ids.')
 
     parser.add_argument('model', help="File to model. This file has to be a csv file with the words to be linked "
